@@ -1,13 +1,8 @@
-use amm::{
-    constants::VOLTR_VAULT_PROGRAM,
-    derive_receipt_pda, derive_vault_lp_mint_pda,
-    state::Vault,
-    VoltrAmm, VoltrRedeemSwap, VoltrSwap,
-};
+use amm::{constants::VOLTR_VAULT_PROGRAM, state::Vault, VoltrAmm, VoltrSwap};
 use jupiter_amm_interface::{Amm, QuoteParams, SwapMode};
 use solana_program_test::ProgramTest;
 use solana_sdk::{
-    instruction::AccountMeta,
+    instruction::{AccountMeta, Instruction},
     program_pack::Pack,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
@@ -136,18 +131,24 @@ async fn test_deposit_and_withdraw() {
         issuance_fee_bps,
     );
 
-    let deposit_ix = VoltrSwap {
+    let deposit_accounts: Vec<AccountMeta> = VoltrSwap {
         vault_key,
-        vault_asset_mint: asset_mint,
+        source_mint: asset_mint,
+        destination_mint: lp_mint,
         vault_asset_idle_ata: voltr_amm.vault_state.asset.idle_ata,
-        vault_lp_mint: lp_mint,
         user_source: user_asset_ata,
         user_destination: user_lp_ata,
         user_transfer_authority: payer.pubkey(),
         asset_token_program: voltr_amm.asset_token_program,
     }
-    .into_instruction(deposit_amount)
+    .try_into()
     .unwrap();
+
+    let deposit_ix = Instruction {
+        program_id: VOLTR_VAULT_PROGRAM,
+        accounts: deposit_accounts,
+        data: get_ix_data("deposit_vault", deposit_amount),
+    };
 
     let deposit_tx = Transaction::new_signed_with_payer(
         &[deposit_ix],
@@ -206,35 +207,28 @@ async fn test_deposit_and_withdraw() {
         redemption_fee_bps,
     );
 
-    let placeholder = AccountMeta::new_readonly(Pubkey::new_unique(), false);
-    let redeem_swap = VoltrRedeemSwap {
+    let withdraw_accounts: Vec<AccountMeta> = VoltrSwap {
         vault_key,
-        vault_asset_mint: asset_mint,
+        source_mint: lp_mint,
+        destination_mint: asset_mint,
         vault_asset_idle_ata: voltr_amm.vault_state.asset.idle_ata,
-        vault_lp_mint: lp_mint,
-        user_lp_ata,
-        user_asset_ata: user_asset_ata,
+        user_source: user_lp_ata,
+        user_destination: user_asset_ata,
         user_transfer_authority: payer.pubkey(),
         asset_token_program: voltr_amm.asset_token_program,
-        placeholder,
+    }
+    .try_into()
+    .unwrap();
+
+    let withdraw_ix = Instruction {
+        program_id: VOLTR_VAULT_PROGRAM,
+        accounts: withdraw_accounts,
+        data: get_ix_data("instant_withdraw_vault", withdraw_lp_amount),
     };
-
-    let [request_withdraw_ix, withdraw_ix] = redeem_swap
-        .into_instructions(withdraw_lp_amount)
-        .unwrap();
-
-    let receipt_pda = derive_receipt_pda(&vault_key, &payer.pubkey());
-    let vault_lp_mint_pda = derive_vault_lp_mint_pda(&vault_key);
-    let create_receipt_lp_ata_ix = create_associated_token_account(
-        &payer.pubkey(),
-        &receipt_pda,
-        &vault_lp_mint_pda,
-        &token_program_id(),
-    );
 
     let recent_blockhash = banks_client.get_latest_blockhash().await.unwrap();
     let withdraw_tx = Transaction::new_signed_with_payer(
-        &[create_receipt_lp_ata_ix, request_withdraw_ix, withdraw_ix],
+        &[withdraw_ix],
         Some(&payer.pubkey()),
         &[&payer],
         recent_blockhash,
@@ -275,4 +269,17 @@ async fn test_deposit_and_withdraw() {
     account_map =
         load_account_map_from_bank(&mut banks_client, account_map_addresses.as_slice()).await;
     voltr_amm.update(&account_map).unwrap();
+}
+
+fn get_ix_data(ix_name: &str, amount: u64) -> Vec<u8> {
+    let preimage = format!("global:{}", ix_name);
+    let hash = solana_sdk::hash::hash(preimage.as_bytes());
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&hash.to_bytes()[..8]);
+    buf.extend_from_slice(&amount.to_le_bytes());
+    if ix_name.contains("withdraw") {
+        buf.push(1u8);
+        buf.push(0u8);
+    }
+    buf
 }

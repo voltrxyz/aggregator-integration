@@ -5,7 +5,7 @@ use jupiter_amm_interface::{
     SwapAndAccountMetas, SwapParams,
 };
 use solana_sdk::{
-    instruction::{AccountMeta, Instruction},
+    instruction::AccountMeta,
     program_pack::Pack,
     pubkey::Pubkey,
     system_program::ID as SystemProgramId,
@@ -22,25 +22,6 @@ use math::*;
 use state::Vault;
 
 pub mod state;
-
-fn anchor_discriminator(name: &str) -> [u8; 8] {
-    let preimage = format!("global:{}", name);
-    let mut sighash = [0u8; 8];
-    sighash.copy_from_slice(&solana_sdk::hash::hash(preimage.as_bytes()).to_bytes()[..8]);
-    sighash
-}
-
-pub fn derive_receipt_pda(vault_key: &Pubkey, user: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(
-        &[
-            REQUEST_WITHDRAW_VAULT_RECEIPT_SEED,
-            vault_key.as_ref(),
-            user.as_ref(),
-        ],
-        &VOLTR_VAULT_PROGRAM,
-    )
-    .0
-}
 
 pub fn derive_vault_lp_mint_pda(vault_key: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
@@ -193,27 +174,13 @@ impl Clone for VoltrAmm {
 #[derive(Copy, Clone, Debug)]
 pub struct VoltrSwap {
     pub vault_key: Pubkey,
-    pub vault_asset_mint: Pubkey,
+    pub source_mint: Pubkey,
+    pub destination_mint: Pubkey,
     pub vault_asset_idle_ata: Pubkey,
-    pub vault_lp_mint: Pubkey,
     pub user_source: Pubkey,
     pub user_destination: Pubkey,
     pub user_transfer_authority: Pubkey,
     pub asset_token_program: Pubkey,
-}
-
-impl VoltrSwap {
-    pub fn into_instruction(self, deposit_amount: u64) -> Result<Instruction> {
-        let metas: Vec<AccountMeta> = self.try_into()?;
-        let mut data = Vec::with_capacity(16);
-        data.extend_from_slice(&anchor_discriminator("deposit_vault"));
-        data.extend_from_slice(&deposit_amount.to_le_bytes());
-        Ok(Instruction {
-            program_id: VOLTR_VAULT_PROGRAM,
-            accounts: metas,
-            data,
-        })
-    }
 }
 
 impl TryFrom<VoltrSwap> for Vec<AccountMeta> {
@@ -233,146 +200,43 @@ impl TryFrom<VoltrSwap> for Vec<AccountMeta> {
             &VOLTR_VAULT_PROGRAM,
         );
 
-        let (vault_lp_mint_auth_pda, _) = Pubkey::find_program_address(
-            &[VAULT_LP_MINT_AUTH_SEED, swap.vault_key.as_ref()],
-            &VOLTR_VAULT_PROGRAM,
-        );
+        let is_redeem = swap.source_mint == vault_lp_mint_pda;
+        let vault_asset_mint = if is_redeem {
+            swap.destination_mint
+        } else {
+            swap.source_mint
+        };
 
-        Ok(vec![
+        let mut accounts = vec![
             AccountMeta::new_readonly(swap.user_transfer_authority, true),
             AccountMeta::new_readonly(protocol_pda, false),
             AccountMeta::new(swap.vault_key, false),
-            AccountMeta::new_readonly(swap.vault_asset_mint, false),
+            AccountMeta::new_readonly(vault_asset_mint, false),
             AccountMeta::new(vault_lp_mint_pda, false),
             AccountMeta::new(swap.user_source, false),
             AccountMeta::new(swap.vault_asset_idle_ata, false),
-            AccountMeta::new_readonly(vault_asset_idle_auth_pda, false),
-            AccountMeta::new(swap.user_destination, false),
-            AccountMeta::new_readonly(vault_lp_mint_auth_pda, false),
+        ];
+
+        if is_redeem {
+            accounts.push(AccountMeta::new(vault_asset_idle_auth_pda, false));
+            accounts.push(AccountMeta::new(swap.user_destination, false));
+        } else {
+            accounts.push(AccountMeta::new_readonly(vault_asset_idle_auth_pda, false));
+            accounts.push(AccountMeta::new(swap.user_destination, false));
+            let (vault_lp_mint_auth_pda, _) = Pubkey::find_program_address(
+                &[VAULT_LP_MINT_AUTH_SEED, swap.vault_key.as_ref()],
+                &VOLTR_VAULT_PROGRAM,
+            );
+            accounts.push(AccountMeta::new_readonly(vault_lp_mint_auth_pda, false));
+        }
+
+        accounts.extend_from_slice(&[
             AccountMeta::new_readonly(swap.asset_token_program, false),
             AccountMeta::new_readonly(TOKEN_PROGRAM, false),
             AccountMeta::new_readonly(SystemProgramId, false),
-        ])
-    }
-}
+        ]);
 
-#[derive(Clone, Debug)]
-pub struct VoltrRedeemSwap {
-    pub vault_key: Pubkey,
-    pub vault_asset_mint: Pubkey,
-    pub vault_asset_idle_ata: Pubkey,
-    pub vault_lp_mint: Pubkey,
-    pub user_lp_ata: Pubkey,
-    pub user_asset_ata: Pubkey,
-    pub user_transfer_authority: Pubkey,
-    pub asset_token_program: Pubkey,
-    pub placeholder: AccountMeta,
-}
-
-impl VoltrRedeemSwap {
-    /// Split concatenated account metas into `[request_withdraw_vault, withdraw_vault]` instructions.
-    /// The caller must also create the receipt's LP ATA before these instructions
-    /// using `derive_receipt_pda` and `derive_vault_lp_mint_pda`.
-    pub fn into_instructions(self, lp_amount: u64) -> Result<[Instruction; 2]> {
-        let placeholder = self.placeholder.clone();
-        let metas: Vec<AccountMeta> = self.try_into()?;
-
-        let split_at = metas
-            .iter()
-            .position(|meta| *meta == placeholder)
-            .ok_or_else(|| anyhow::anyhow!("Placeholder not found in account metas"))?;
-
-        let mut request_data = Vec::with_capacity(18);
-        request_data.extend_from_slice(&anchor_discriminator("request_withdraw_vault"));
-        request_data.extend_from_slice(&lp_amount.to_le_bytes());
-        request_data.push(1); // is_amount_in_lp = true
-        request_data.push(0); // is_withdraw_all = false
-
-        let request_withdraw_ix = Instruction {
-            program_id: VOLTR_VAULT_PROGRAM,
-            accounts: metas[..split_at].to_vec(),
-            data: request_data,
-        };
-
-        let withdraw_ix = Instruction {
-            program_id: VOLTR_VAULT_PROGRAM,
-            accounts: metas[split_at + 1..].to_vec(),
-            data: anchor_discriminator("withdraw_vault").to_vec(),
-        };
-
-        Ok([request_withdraw_ix, withdraw_ix])
-    }
-}
-
-impl TryFrom<VoltrRedeemSwap> for Vec<AccountMeta> {
-    type Error = anyhow::Error;
-
-    fn try_from(swap: VoltrRedeemSwap) -> Result<Self> {
-        let (protocol_pda, _) =
-            Pubkey::find_program_address(&[PROTOCOL_SEED], &VOLTR_VAULT_PROGRAM);
-
-        let (vault_lp_mint_pda, _) = Pubkey::find_program_address(
-            &[VAULT_LP_MINT_SEED, swap.vault_key.as_ref()],
-            &VOLTR_VAULT_PROGRAM,
-        );
-
-        let (vault_asset_idle_auth_pda, _) = Pubkey::find_program_address(
-            &[VAULT_ASSET_IDLE_AUTH_SEED, swap.vault_key.as_ref()],
-            &VOLTR_VAULT_PROGRAM,
-        );
-
-        let (receipt_pda, _) = Pubkey::find_program_address(
-            &[
-                REQUEST_WITHDRAW_VAULT_RECEIPT_SEED,
-                swap.vault_key.as_ref(),
-                swap.user_transfer_authority.as_ref(),
-            ],
-            &VOLTR_VAULT_PROGRAM,
-        );
-
-        let receipt_lp_ata = Pubkey::find_program_address(
-            &[
-                receipt_pda.as_ref(),
-                TOKEN_PROGRAM.as_ref(),
-                vault_lp_mint_pda.as_ref(),
-            ],
-            &ATA_PROGRAM,
-        )
-        .0;
-
-        let mut metas = Vec::with_capacity(24);
-
-        // request_withdraw_vault accounts
-        metas.push(AccountMeta::new(swap.user_transfer_authority, true));
-        metas.push(AccountMeta::new_readonly(swap.user_transfer_authority, true));
-        metas.push(AccountMeta::new_readonly(protocol_pda, false));
-        metas.push(AccountMeta::new_readonly(swap.vault_key, false));
-        metas.push(AccountMeta::new_readonly(vault_lp_mint_pda, false));
-        metas.push(AccountMeta::new(swap.user_lp_ata, false));
-        metas.push(AccountMeta::new(receipt_lp_ata, false));
-        metas.push(AccountMeta::new(receipt_pda, false));
-        metas.push(AccountMeta::new_readonly(TOKEN_PROGRAM, false));
-        metas.push(AccountMeta::new_readonly(SystemProgramId, false));
-
-        // placeholder separator
-        metas.push(swap.placeholder);
-
-        // withdraw_vault accounts
-        metas.push(AccountMeta::new(swap.user_transfer_authority, true));
-        metas.push(AccountMeta::new_readonly(protocol_pda, false));
-        metas.push(AccountMeta::new(swap.vault_key, false));
-        metas.push(AccountMeta::new_readonly(swap.vault_asset_mint, false));
-        metas.push(AccountMeta::new(vault_lp_mint_pda, false));
-        metas.push(AccountMeta::new(receipt_lp_ata, false));
-        metas.push(AccountMeta::new(swap.vault_asset_idle_ata, false));
-        metas.push(AccountMeta::new(vault_asset_idle_auth_pda, false));
-        metas.push(AccountMeta::new(swap.user_asset_ata, false));
-        metas.push(AccountMeta::new(receipt_pda, false));
-        metas.push(AccountMeta::new_readonly(swap.asset_token_program, false));
-        metas.push(AccountMeta::new_readonly(TOKEN_PROGRAM, false));
-        metas.push(AccountMeta::new_readonly(SystemProgramId, false));
-
-        Ok(metas)
+        Ok(accounts)
     }
 }
 
@@ -547,40 +411,11 @@ impl Amm for VoltrAmm {
             ..
         } = swap_params;
 
-        let is_issue = *source_mint == self.vault_state.asset.mint
-            && *destination_mint == self.vault_state.lp.mint;
-        let is_redeem = *source_mint == self.vault_state.lp.mint
-            && *destination_mint == self.vault_state.asset.mint;
-
-        if !is_issue && !is_redeem {
-            return Err(VoltrAmmError::InvalidSourceMint.into());
-        }
-
-        if is_redeem {
-            let mut account_metas: Vec<AccountMeta> = VoltrRedeemSwap {
-                vault_key: self.vault_key,
-                vault_asset_mint: self.vault_state.asset.mint,
-                vault_asset_idle_ata: self.vault_state.asset.idle_ata,
-                vault_lp_mint: self.vault_state.lp.mint,
-                user_lp_ata: *source_token_account,
-                user_asset_ata: *destination_token_account,
-                user_transfer_authority: *token_transfer_authority,
-                asset_token_program: self.asset_token_program,
-                placeholder: swap_params.placeholder_account_meta(),
-            }
-            .try_into()?;
-            account_metas.push(swap_params.placeholder_account_meta());
-            return Ok(SwapAndAccountMetas {
-                swap: Swap::TokenSwap,
-                account_metas,
-            });
-        }
-
         let mut account_metas: Vec<AccountMeta> = VoltrSwap {
             vault_key: self.vault_key,
-            vault_asset_mint: self.vault_state.asset.mint,
+            source_mint: *source_mint,
+            destination_mint: *destination_mint,
             vault_asset_idle_ata: self.vault_state.asset.idle_ata,
-            vault_lp_mint: self.vault_state.lp.mint,
             user_source: *source_token_account,
             user_destination: *destination_token_account,
             user_transfer_authority: *token_transfer_authority,
